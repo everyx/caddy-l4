@@ -153,6 +153,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 func (h *Handler) Handle(down *layer4.Connection, _ layer4.Handler) error {
 	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
 
+	// ensure downstream is in a clean state for proxying
+	_ = down.SetDeadline(time.Time{})
+	if tcp, ok := down.Conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+	}
+
 	start := time.Now()
 
 	var upConns []net.Conn
@@ -229,13 +236,19 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
 			up, err = net.Dial(p.address.Network, hostPort)
 		} else {
 			// the prepared config could be nil if user enabled but did not customize TLS,
-			// in which case we adopt the downstream client's TLS ClientHello for ours;
+			// but in any case we adopt the downstream client's TLS ClientHello for ours;
 			// i.e. by default, make the client's TLS config as transparent as possible
 			tlsCfg := upstream.tlsConfig
 			if tlsCfg == nil {
 				tlsCfg = new(tls.Config)
-				if hellos := l4tls.GetClientHelloInfos(down); len(hellos) > 0 {
-					hellos[0].FillTLSClientConfig(tlsCfg)
+			}
+			if hellos := l4tls.GetClientHelloInfos(down); len(hellos) > 0 {
+				hellos[0].FillTLSClientConfig(tlsCfg)
+			}
+			if connStates := l4tls.GetConnectionStates(down); len(connStates) > 0 {
+				nextProto := connStates[0].NegotiatedProtocol
+				if len(nextProto) > 0 {
+					tlsCfg.NextProtos = []string{nextProto}
 				}
 			}
 			up, err = tls.Dial(p.address.Network, hostPort, tlsCfg)
@@ -301,6 +314,44 @@ func (h *Handler) dialPeers(upstream *Upstream, repl *caddy.Replacer, down *laye
 
 // proxy proxies the downstream connection to all upstream connections.
 func (h *Handler) proxy(down *layer4.Connection, upConns []net.Conn) {
+	// special case: if we have only one upstream, we want to be as transparent as possible
+	// to avoid TCP fragmentation or timing issues for sensitive protocols (Reality).
+	if len(upConns) == 1 {
+		up := upConns[0]
+		
+		// 1. send any initial handshake data that Caddy already "peeked" during matching
+		initialData := down.FlushBuffer()
+		if len(initialData) > 0 {
+			_, _ = up.Write(initialData)
+		}
+
+		// 2. start a raw bidirectional pipe directly between the underlying net.Conn objects.
+		// this bypasses layer4.Connection's user-space buffering entirely.
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(up, down.Conn)
+			if cu, ok := up.(closeWriter); ok {
+				_ = cu.CloseWrite()
+			} else {
+				_ = up.Close()
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(down.Conn, up)
+			if cd, ok := down.Conn.(closeWriter); ok {
+				_ = cd.CloseWrite()
+			}
+		}()
+
+		wg.Wait()
+		return
+	}
+
 	// every time we read from downstream, we write
 	// the same to each upstream; this is half of
 	// the proxy duplex

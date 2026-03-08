@@ -70,7 +70,7 @@ func parseRawClientHello(data []byte) (info ClientHelloInfo) {
 	}
 
 	var extensions cryptobyte.String
-	if !s.ReadUint16LengthPrefixed(&extensions) || !s.Empty() {
+	if !s.ReadUint16LengthPrefixed(&extensions) {
 		return
 	}
 

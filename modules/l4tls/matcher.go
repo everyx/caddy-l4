@@ -104,12 +104,20 @@ func (m *MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 			return false, err
 		}
 
+		// nolint:gosec // disable G602 // https://github.com/securego/gosec/issues/1406
+		length2 := int(uint16(hdr2[3])<<8 | uint16(hdr2[4]))
+
+		if hdr2[0] == 0x14 { // skip ChangeCipherSpec (Issue #374)
+			body2 := make([]byte, length2)
+			_, err = io.ReadFull(cx, body2)
+			if err != nil {
+				return false, err
+			}
+			continue
+		}
 		if hdr2[0] != recordTypeHandshake {
 			break
 		}
-
-		// nolint:gosec // disable G602 // https://github.com/securego/gosec/issues/1406
-		length2 := int(uint16(hdr2[3])<<8 | uint16(hdr2[4]))
 		if len(rawHello)+length2 > layer4.MaxMatchingBytes {
 			return false, fmt.Errorf("TLS records too large: %d > %d", len(rawHello)+length2, layer4.MaxMatchingBytes)
 		}
@@ -139,12 +147,20 @@ func (m *MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 				return false, err
 			}
 
+			// nolint:gosec // disable G602 // https://github.com/securego/gosec/issues/1406
+			length2 := int(uint16(hdr2[3])<<8 | uint16(hdr2[4]))
+
+			if hdr2[0] == 0x14 { // skip ChangeCipherSpec (Issue #374)
+				body2 := make([]byte, length2)
+				_, err = io.ReadFull(cx, body2)
+				if err != nil {
+					return false, err
+				}
+				continue
+			}
 			if hdr2[0] != recordTypeHandshake {
 				break
 			}
-
-			// nolint:gosec // disable G602 // https://github.com/securego/gosec/issues/1406
-			length2 := int(uint16(hdr2[3])<<8 | uint16(hdr2[4]))
 
 			if len(rawHello)+length2 > layer4.MaxMatchingBytes {
 				return false, fmt.Errorf("TLS records too large: %d > %d", len(rawHello)+length2, layer4.MaxMatchingBytes)

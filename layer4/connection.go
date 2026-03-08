@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -129,6 +130,18 @@ func (cx *Connection) Read(p []byte) (n int, err error) {
 			// if we are not in matching mode reset buf automatically after it was consumed
 			cx.offset = 0
 			cx.buf = cx.buf[:0]
+
+			// To avoid unnecessary TCP fragmentation (which can break sensitive protocols
+			// like Reality), if we still have room in p, try to fill it with any
+			// data that has already arrived on the wire.
+			if n < len(p) {
+				// use a very short deadline or check if data is available to avoid blocking
+				// for now, we do a non-blocking-ish read if the implementation supports it,
+				// or just a standard read which will return available data.
+				n2, err := cx.Conn.Read(p[n:])
+				n += n2
+				return n, err
+			}
 		}
 		return n, nil
 	}
@@ -147,6 +160,46 @@ func (cx *Connection) Write(p []byte) (n int, err error) {
 	n, err = cx.Conn.Write(p)
 	cx.bytesWritten += uint64(n) //nolint:gosec // disable G115
 	return
+}
+
+// WriteTo implements io.WriterTo to allow zero-copy optimizations.
+func (cx *Connection) WriteTo(w io.Writer) (n int64, err error) {
+	// if we are matching and consumed the buffer exit with error
+	if cx.matching && (len(cx.buf) == 0 || len(cx.buf) == cx.offset) {
+		return 0, ErrConsumedAllPrefetchedBytes
+	}
+
+	// first, deplete the buffer
+	if len(cx.buf) > 0 && cx.offset < len(cx.buf) {
+		nw, err := w.Write(cx.buf[cx.offset:])
+		n += int64(nw)
+		cx.offset += nw
+		if err != nil {
+			return n, err
+		}
+		// if not matching, reset the buffer since it's depleted
+		if !cx.matching {
+			cx.offset = 0
+			cx.buf = cx.buf[:0]
+		}
+	}
+
+	// then, copy the rest from the underlying connection;
+	// if both sides are TCP, Go will use splice/sendfile.
+	// we use cx.Conn directly to bypass our own Read() which has matching logic.
+	nw, err := io.Copy(w, cx.Conn)
+	n += nw
+	cx.bytesRead += uint64(nw)
+
+	return n, err
+}
+
+// ReadFrom implements io.ReaderFrom to allow zero-copy optimizations.
+func (cx *Connection) ReadFrom(r io.Reader) (n int64, err error) {
+	// we use cx.Conn directly to bypass our own Write() logic.
+	n, err = io.Copy(cx.Conn, r)
+	cx.bytesWritten += uint64(n)
+	return n, err
 }
 
 // Wrap wraps conn in a new Connection based on cx (reusing
@@ -285,6 +338,20 @@ func (cx *Connection) MatchingBytes() []byte {
 	return cx.buf[cx.offset:]
 }
 
+// FlushBuffer returns all captures bytes and clears the internal buffer.
+// This is used for transparent proxying where we want to send the initial
+// handshake data before handing over the raw connection to io.Copy.
+func (cx *Connection) FlushBuffer() []byte {
+	if len(cx.buf) == 0 {
+		return nil
+	}
+	data := make([]byte, len(cx.buf)-cx.offset)
+	copy(data, cx.buf[cx.offset:])
+	cx.buf = cx.buf[:0]
+	cx.offset = 0
+	return data
+}
+
 var (
 	// VarsCtxKey is the key used to store the variables table
 	// in a Connection's context.
@@ -297,8 +364,8 @@ var (
 	listenerCtxKey caddy.CtxKey = "listener"
 )
 
-// the prefetch chunk size is a very large 2kb, in order to completely fetch the ~1.7kb X25519Kyber768Draft00 based TLS ClientHello. https://pq.cloudflareresearch.com/
-const prefetchChunkSize = 2048
+// the prefetch chunk size is increased to 4kb to accommodate large post-quantum TLS ClientHellos
+const prefetchChunkSize = 4096
 
 // MaxMatchingBytes is the amount of bytes that are at most prefetched during matching.
 // This is probably most relevant for the http matcher since http requests do not have a size limit.
